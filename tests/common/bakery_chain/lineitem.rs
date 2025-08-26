@@ -5,10 +5,12 @@ use sea_orm::entity::prelude::*;
 pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
-    #[sea_orm(column_type = "Decimal(Some((19, 4)))")]
+    #[sea_orm(column_type = "Decimal(Some((16, 4)))")]
     pub price: Decimal,
     pub quantity: i32,
+    #[sea_orm(unique_key = "lineitem")]
     pub order_id: i32,
+    #[sea_orm(unique_key = "lineitem")]
     pub cake_id: i32,
 }
 
@@ -25,9 +27,7 @@ pub enum Relation {
     #[sea_orm(
         belongs_to = "super::cake::Entity",
         from = "Column::CakeId",
-        to = "super::cake::Column::Id",
-        on_update = "Cascade",
-        on_delete = "Cascade"
+        to = "super::cake::Column::Id"
     )]
     Cake,
 }

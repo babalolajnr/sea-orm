@@ -1,8 +1,10 @@
-use crate::{unpack_table_ref, EntityTrait, Identity, IdentityOf, Iterable, QuerySelect, Select};
+use crate::{
+    EntityTrait, Identity, IdentityOf, Iterable, QuerySelect, Select, join_tbl_on_condition,
+};
 use core::marker::PhantomData;
 use sea_query::{
-    Alias, Condition, DynIden, ForeignKeyCreateStatement, JoinType, SeaRc, TableForeignKey,
-    TableRef,
+    Condition, ConditionType, DynIden, ForeignKeyCreateStatement, IntoIden, JoinType, SeaRc,
+    TableForeignKey, TableRef,
 };
 use std::fmt::Debug;
 
@@ -21,7 +23,7 @@ pub type ForeignKeyAction = sea_query::ForeignKeyAction;
 
 /// Defines the relations of an Entity
 pub trait RelationTrait: Iterable + Debug + 'static {
-    /// The method to call
+    /// Creates a [`RelationDef`]
     fn def(&self) -> RelationDef;
 }
 
@@ -68,6 +70,8 @@ pub struct RelationDef {
     pub on_condition: Option<Box<dyn Fn(DynIden, DynIden) -> Condition + Send + Sync>>,
     /// The name of foreign key constraint
     pub fk_name: Option<String>,
+    /// Condition type of join on expression
+    pub condition_type: ConditionType,
 }
 
 impl std::fmt::Debug for RelationDef {
@@ -94,15 +98,74 @@ fn debug_on_condition(
         Some(func) => {
             d.field(
                 "on_condition",
-                &func(
-                    SeaRc::new(Alias::new("left")),
-                    SeaRc::new(Alias::new("right")),
-                ),
+                &func(SeaRc::new("left"), SeaRc::new("right")),
             );
         }
         None => {
             d.field("on_condition", &Option::<Condition>::None);
         }
+    }
+}
+
+/// Idiomatically generate the join condition.
+///
+/// This allows using [RelationDef] directly where [`sea_query`] expects an [`IntoCondition`].
+///
+/// ## Examples
+///
+/// ```
+/// use sea_orm::sea_query::*;
+/// use sea_orm::tests_cfg::{cake, fruit};
+/// use sea_orm::*;
+///
+/// let query = Query::select()
+///     .from(fruit::Entity)
+///     .inner_join(cake::Entity, fruit::Relation::Cake.def())
+///     .to_owned();
+///
+/// assert_eq!(
+///     query.to_string(MysqlQueryBuilder),
+///     r#"SELECT  FROM `fruit` INNER JOIN `cake` ON `fruit`.`cake_id` = `cake`.`id`"#
+/// );
+/// assert_eq!(
+///     query.to_string(PostgresQueryBuilder),
+///     r#"SELECT  FROM "fruit" INNER JOIN "cake" ON "fruit"."cake_id" = "cake"."id""#
+/// );
+/// assert_eq!(
+///     query.to_string(SqliteQueryBuilder),
+///     r#"SELECT  FROM "fruit" INNER JOIN "cake" ON "fruit"."cake_id" = "cake"."id""#
+/// );
+/// ```
+impl From<RelationDef> for Condition {
+    fn from(mut rel: RelationDef) -> Condition {
+        // Use table alias (if any) to construct the join condition
+        let from_tbl = match rel.from_tbl.sea_orm_table_alias() {
+            Some(alias) => alias,
+            None => rel.from_tbl.sea_orm_table(),
+        };
+        let to_tbl = match rel.to_tbl.sea_orm_table_alias() {
+            Some(alias) => alias,
+            None => rel.to_tbl.sea_orm_table(),
+        };
+        let owner_keys = rel.from_col;
+        let foreign_keys = rel.to_col;
+
+        let mut condition = match rel.condition_type {
+            ConditionType::All => Condition::all(),
+            ConditionType::Any => Condition::any(),
+        };
+
+        condition = condition.add(join_tbl_on_condition(
+            SeaRc::clone(from_tbl),
+            SeaRc::clone(to_tbl),
+            owner_keys,
+            foreign_keys,
+        ));
+        if let Some(f) = rel.on_condition.take() {
+            condition = condition.add(f(from_tbl.clone(), to_tbl.clone()));
+        }
+
+        condition
     }
 }
 
@@ -123,6 +186,7 @@ where
     on_update: Option<ForeignKeyAction>,
     on_condition: Option<Box<dyn Fn(DynIden, DynIden) -> Condition + Send + Sync>>,
     fk_name: Option<String>,
+    condition_type: ConditionType,
 }
 
 impl<E, R> std::fmt::Debug for RelationBuilder<E, R>
@@ -160,7 +224,58 @@ impl RelationDef {
             on_update: self.on_update,
             on_condition: self.on_condition,
             fk_name: None,
+            condition_type: self.condition_type,
         }
+    }
+
+    /// Express the relation from a table alias.
+    ///
+    /// This is a shorter and more discoverable equivalent to modifying `from_tbl` field by hand.
+    ///
+    /// # Examples
+    ///
+    /// Here's a short synthetic example.
+    /// In real life you'd use aliases when the table name comes up twice and you need to disambiguate,
+    /// e.g. https://github.com/SeaQL/sea-orm/discussions/2133
+    ///
+    /// ```
+    /// use sea_orm::{
+    ///     DbBackend,
+    ///     entity::*,
+    ///     query::*,
+    ///     tests_cfg::{cake, cake_filling},
+    /// };
+    /// use sea_query::Alias;
+    ///
+    /// let cf = "cf";
+    ///
+    /// assert_eq!(
+    ///     cake::Entity::find()
+    ///         .join_as(
+    ///             JoinType::LeftJoin,
+    ///             cake_filling::Relation::Cake.def().rev(),
+    ///             cf.clone()
+    ///         )
+    ///         .join(
+    ///             JoinType::LeftJoin,
+    ///             cake_filling::Relation::Filling.def().from_alias(cf)
+    ///         )
+    ///         .build(DbBackend::MySql)
+    ///         .to_string(),
+    ///     [
+    ///         "SELECT `cake`.`id`, `cake`.`name` FROM `cake`",
+    ///         "LEFT JOIN `cake_filling` AS `cf` ON `cake`.`id` = `cf`.`cake_id`",
+    ///         "LEFT JOIN `filling` ON `cf`.`filling_id` = `filling`.`id`",
+    ///     ]
+    ///     .join(" ")
+    /// );
+    /// ```
+    pub fn from_alias<A>(mut self, alias: A) -> Self
+    where
+        A: IntoIden,
+    {
+        self.from_tbl = self.from_tbl.alias(alias);
+        self
     }
 
     /// Set custom join ON condition.
@@ -174,7 +289,7 @@ impl RelationDef {
     ///
     /// ```
     /// use sea_orm::{entity::*, query::*, DbBackend, tests_cfg::{cake, cake_filling}};
-    /// use sea_query::{Expr, IntoCondition};
+    /// use sea_query::{Expr, ExprTrait, IntoCondition};
     ///
     /// assert_eq!(
     ///     cake::Entity::find()
@@ -205,6 +320,42 @@ impl RelationDef {
         self.on_condition = Some(Box::new(f));
         self
     }
+
+    /// Set the condition type of join on expression
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use sea_orm::{entity::*, query::*, DbBackend, tests_cfg::{cake, cake_filling}};
+    /// use sea_query::{Expr, ExprTrait, IntoCondition, ConditionType};
+    ///
+    /// assert_eq!(
+    ///     cake::Entity::find()
+    ///         .join(
+    ///             JoinType::LeftJoin,
+    ///             cake_filling::Relation::Cake
+    ///                 .def()
+    ///                 .rev()
+    ///                 .condition_type(ConditionType::Any)
+    ///                 .on_condition(|_left, right| {
+    ///                     Expr::col((right, cake_filling::Column::CakeId))
+    ///                         .gt(10i32)
+    ///                         .into_condition()
+    ///                 })
+    ///         )
+    ///         .build(DbBackend::MySql)
+    ///         .to_string(),
+    ///     [
+    ///         "SELECT `cake`.`id`, `cake`.`name` FROM `cake`",
+    ///         "LEFT JOIN `cake_filling` ON `cake`.`id` = `cake_filling`.`cake_id` OR `cake_filling`.`cake_id` > 10",
+    ///     ]
+    ///     .join(" ")
+    /// );
+    /// ```
+    pub fn condition_type(mut self, condition_type: ConditionType) -> Self {
+        self.condition_type = condition_type;
+        self
+    }
 }
 
 impl<E, R> RelationBuilder<E, R>
@@ -225,6 +376,7 @@ where
             on_update: None,
             on_condition: None,
             fk_name: None,
+            condition_type: ConditionType::All,
         }
     }
 
@@ -241,6 +393,7 @@ where
             on_update: None,
             on_condition: None,
             fk_name: None,
+            condition_type: ConditionType::All,
         }
     }
 
@@ -291,6 +444,12 @@ where
         self.fk_name = Some(fk_name.to_owned());
         self
     }
+
+    /// Set the condition type of join on expression
+    pub fn condition_type(mut self, condition_type: ConditionType) -> Self {
+        self.condition_type = condition_type;
+        self
+    }
 }
 
 impl<E, R> From<RelationBuilder<E, R>> for RelationDef
@@ -310,37 +469,24 @@ where
             on_update: b.on_update,
             on_condition: b.on_condition,
             fk_name: b.fk_name,
+            condition_type: b.condition_type,
         }
     }
 }
 
 macro_rules! set_foreign_key_stmt {
     ( $relation: ident, $foreign_key: ident ) => {
-        let from_cols: Vec<String> = match $relation.from_col {
-            Identity::Unary(o1) => vec![o1],
-            Identity::Binary(o1, o2) => vec![o1, o2],
-            Identity::Ternary(o1, o2, o3) => vec![o1, o2, o3],
-        }
-        .into_iter()
-        .map(|col| {
-            let col_name = col.to_string();
-            $foreign_key.from_col(col);
-            col_name
-        })
-        .collect();
-        match $relation.to_col {
-            Identity::Unary(o1) => {
-                $foreign_key.to_col(o1);
-            }
-            Identity::Binary(o1, o2) => {
-                $foreign_key.to_col(o1);
-                $foreign_key.to_col(o2);
-            }
-            Identity::Ternary(o1, o2, o3) => {
-                $foreign_key.to_col(o1);
-                $foreign_key.to_col(o2);
-                $foreign_key.to_col(o3);
-            }
+        let from_cols: Vec<String> = $relation
+            .from_col
+            .into_iter()
+            .map(|col| {
+                let col_name = col.to_string();
+                $foreign_key.from_col(col);
+                col_name
+            })
+            .collect();
+        for col in $relation.to_col.into_iter() {
+            $foreign_key.to_col(col);
         }
         if let Some(action) = $relation.on_delete {
             $foreign_key.on_delete(action);
@@ -351,7 +497,7 @@ macro_rules! set_foreign_key_stmt {
         let name = if let Some(name) = $relation.fk_name {
             name
         } else {
-            let from_tbl = unpack_table_ref(&$relation.from_tbl);
+            let from_tbl = &$relation.from_tbl.sea_orm_table().clone();
             format!("fk-{}-{}", from_tbl.to_string(), from_cols.join("-"))
         };
         $foreign_key.name(&name);
@@ -363,32 +509,33 @@ impl From<RelationDef> for ForeignKeyCreateStatement {
         let mut foreign_key_stmt = Self::new();
         set_foreign_key_stmt!(relation, foreign_key_stmt);
         foreign_key_stmt
-            .from_tbl(unpack_table_ref(&relation.from_tbl))
-            .to_tbl(unpack_table_ref(&relation.to_tbl))
+            .from_tbl(relation.from_tbl.sea_orm_table().clone())
+            .to_tbl(relation.to_tbl.sea_orm_table().clone())
             .take()
     }
 }
 
 /// Creates a column definition for example to update a table.
 /// ```
-/// use sea_query::{Alias, IntoIden, MysqlQueryBuilder, TableAlterStatement, TableRef};
+/// use sea_query::{Alias, IntoIden, MysqlQueryBuilder, TableAlterStatement, IntoTableRef, ConditionType};
 /// use sea_orm::{EnumIter, Iden, Identity, PrimaryKeyTrait, RelationDef, RelationTrait, RelationType};
 ///
 /// let relation = RelationDef {
 ///     rel_type: RelationType::HasOne,
-///     from_tbl: TableRef::Table(Alias::new("foo").into_iden()),
-///     to_tbl: TableRef::Table(Alias::new("bar").into_iden()),
-///     from_col: Identity::Unary(Alias::new("bar_id").into_iden()),
-///     to_col: Identity::Unary(Alias::new("bar_id").into_iden()),
+///     from_tbl: "foo".into_table_ref(),
+///     to_tbl: "bar".into_table_ref(),
+///     from_col: Identity::Unary("bar_id".into_iden()),
+///     to_col: Identity::Unary("bar_id".into_iden()),
 ///     is_owner: false,
 ///     on_delete: None,
 ///     on_update: None,
 ///     on_condition: None,
 ///     fk_name: Some("foo-bar".to_string()),
+///     condition_type: ConditionType::All,
 /// };
 ///
 /// let mut alter_table = TableAlterStatement::new()
-///     .table(TableRef::Table(Alias::new("foo").into_iden()))
+///     .table("foo")
 ///     .add_foreign_key(&mut relation.into()).take();
 /// assert_eq!(
 ///     alter_table.to_string(MysqlQueryBuilder::default()),
@@ -400,8 +547,8 @@ impl From<RelationDef> for TableForeignKey {
         let mut foreign_key = Self::new();
         set_foreign_key_stmt!(relation, foreign_key);
         foreign_key
-            .from_tbl(unpack_table_ref(&relation.from_tbl))
-            .to_tbl(unpack_table_ref(&relation.to_tbl))
+            .from_tbl(relation.from_tbl.sea_orm_table().clone())
+            .to_tbl(relation.to_tbl.sea_orm_table().clone())
             .take()
     }
 }
@@ -409,8 +556,8 @@ impl From<RelationDef> for TableForeignKey {
 #[cfg(test)]
 mod tests {
     use crate::{
-        tests_cfg::{cake, fruit},
         RelationBuilder, RelationDef,
+        tests_cfg::{cake, fruit},
     };
 
     #[test]

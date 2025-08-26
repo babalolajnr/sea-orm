@@ -2,6 +2,15 @@ use proc_macro2::{Ident, TokenStream};
 use quote::quote;
 
 pub fn expand_derive_from_json_query_result(ident: Ident) -> syn::Result<TokenStream> {
+    let impl_not_u8 = if cfg!(feature = "postgres-array") {
+        quote!(
+            #[automatically_derived]
+            impl sea_orm::sea_query::value::with_array::NotU8 for #ident {}
+        )
+    } else {
+        quote!()
+    };
+
     Ok(quote!(
         #[automatically_derived]
         impl sea_orm::TryGetableFromJson for #ident {}
@@ -9,7 +18,12 @@ pub fn expand_derive_from_json_query_result(ident: Ident) -> syn::Result<TokenSt
         #[automatically_derived]
         impl std::convert::From<#ident> for sea_orm::Value {
             fn from(source: #ident) -> Self {
-                sea_orm::Value::Json(serde_json::to_value(&source).ok().map(|s| std::boxed::Box::new(s)))
+                sea_orm::Value::Json(
+                    Some(
+                        serde_json::to_value(&source)
+                            .expect(concat!("Failed to serialize '", stringify!(#ident), "'"))
+                    )
+                )
             }
         }
 
@@ -18,7 +32,7 @@ pub fn expand_derive_from_json_query_result(ident: Ident) -> syn::Result<TokenSt
             fn try_from(v: sea_orm::Value) -> Result<Self, sea_orm::sea_query::ValueTypeErr> {
                 match v {
                     sea_orm::Value::Json(Some(json)) => Ok(
-                        serde_json::from_value(*json).map_err(|_| sea_orm::sea_query::ValueTypeErr)?,
+                        serde_json::from_value(json).map_err(|_| sea_orm::sea_query::ValueTypeErr)?,
                     ),
                     _ => Err(sea_orm::sea_query::ValueTypeErr),
                 }
@@ -43,5 +57,7 @@ pub fn expand_derive_from_json_query_result(ident: Ident) -> syn::Result<TokenSt
                 sea_orm::Value::Json(None)
             }
         }
+
+        #impl_not_u8
     ))
 }

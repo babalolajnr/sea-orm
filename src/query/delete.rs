@@ -1,5 +1,5 @@
 use crate::{
-    ActiveModelTrait, ActiveValue, ColumnTrait, EntityTrait, IntoActiveModel, Iterable,
+    ActiveModelTrait, ActiveValue, ColumnTrait, DbErr, EntityTrait, IntoActiveModel, Iterable,
     PrimaryKeyToColumn, QueryFilter, QueryTrait,
 };
 use core::marker::PhantomData;
@@ -16,6 +16,7 @@ where
     A: ActiveModelTrait,
 {
     pub(crate) query: DeleteStatement,
+    pub(crate) error: Option<DbErr>,
     pub(crate) model: A,
 }
 
@@ -34,7 +35,7 @@ impl Delete {
     ///
     /// Model
     /// ```
-    /// use sea_orm::{entity::*, query::*, tests_cfg::cake, DbBackend};
+    /// use sea_orm::{DbBackend, entity::*, query::*, tests_cfg::cake};
     ///
     /// assert_eq!(
     ///     Delete::one(cake::Model {
@@ -48,7 +49,7 @@ impl Delete {
     /// ```
     /// ActiveModel
     /// ```
-    /// use sea_orm::{entity::*, query::*, tests_cfg::cake, DbBackend};
+    /// use sea_orm::{DbBackend, entity::*, query::*, tests_cfg::cake};
     ///
     /// assert_eq!(
     ///     Delete::one(cake::ActiveModel {
@@ -70,6 +71,7 @@ impl Delete {
             query: DeleteStatement::new()
                 .from_table(A::Entity::default().table_ref())
                 .to_owned(),
+            error: None,
             model: model.into_active_model(),
         };
         myself.prepare()
@@ -78,7 +80,7 @@ impl Delete {
     /// Delete many ActiveModel
     ///
     /// ```
-    /// use sea_orm::{entity::*, query::*, tests_cfg::fruit, DbBackend};
+    /// use sea_orm::{DbBackend, entity::*, query::*, tests_cfg::fruit};
     ///
     /// assert_eq!(
     ///     Delete::many(fruit::Entity)
@@ -113,7 +115,9 @@ where
                 ActiveValue::Set(value) | ActiveValue::Unchanged(value) => {
                     self = self.filter(col.eq(value));
                 }
-                ActiveValue::NotSet => panic!("PrimaryKey is not set"),
+                ActiveValue::NotSet => {
+                    self.error = Some(DbErr::PrimaryKeyNotSet { ctx: "DeleteOne" });
+                }
             }
         }
         self
@@ -183,7 +187,7 @@ where
 #[cfg(test)]
 mod tests {
     use crate::tests_cfg::{cake, fruit};
-    use crate::{entity::*, query::*, DbBackend};
+    use crate::{DbBackend, entity::*, query::*};
 
     #[test]
     fn delete_1() {

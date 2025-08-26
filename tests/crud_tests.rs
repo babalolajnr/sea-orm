@@ -1,7 +1,9 @@
+#![allow(unused_imports, dead_code)]
+
 pub mod common;
 mod crud;
 
-pub use common::{bakery_chain::*, setup::*, TestContext};
+pub use common::{TestContext, bakery_chain::*, setup::*};
 pub use crud::*;
 use sea_orm::DatabaseConnection;
 
@@ -10,11 +12,6 @@ use sea_orm::DatabaseConnection;
 // DATABASE_URL="mysql://root:root@localhost" cargo test --features sqlx-mysql,runtime-async-std-native-tls --test crud_tests
 // DATABASE_URL="postgres://root:root@localhost" cargo test --features sqlx-postgres,runtime-async-std-native-tls --test crud_tests
 #[sea_orm_macros::test]
-#[cfg(any(
-    feature = "sqlx-mysql",
-    feature = "sqlx-sqlite",
-    feature = "sqlx-postgres"
-))]
 async fn main() {
     let ctx = TestContext::new("bakery_chain_schema_crud_tests").await;
     create_tables(&ctx.db).await.unwrap();

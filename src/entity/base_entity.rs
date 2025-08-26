@@ -1,16 +1,17 @@
 use crate::{
-    ActiveModelTrait, ColumnTrait, Delete, DeleteMany, DeleteOne, FromQueryResult, Insert,
-    ModelTrait, PrimaryKeyToColumn, PrimaryKeyTrait, QueryFilter, Related, RelationBuilder,
-    RelationTrait, RelationType, Select, Update, UpdateMany, UpdateOne,
+    ActiveModelBehavior, ActiveModelTrait, ColumnTrait, Delete, DeleteMany, DeleteOne,
+    FromQueryResult, Insert, InsertMany, ModelTrait, PrimaryKeyToColumn, PrimaryKeyTrait,
+    QueryFilter, Related, RelationBuilder, RelationTrait, RelationType, Select, Update, UpdateMany,
+    UpdateOne,
 };
 use sea_query::{Alias, Iden, IntoIden, IntoTableRef, IntoValueTuple, TableRef};
 use std::fmt::Debug;
 pub use strum::IntoEnumIterator as Iterable;
 
 /// Ensure the identifier for an Entity can be converted to a static str
-pub trait IdenStatic: Iden + Copy + Debug + 'static {
+pub trait IdenStatic: Iden + Copy + Debug + Send + Sync + 'static {
     /// Method to call to get the static string identity
-    fn as_str(&self) -> &str;
+    fn as_str(&self) -> &'static str;
 }
 
 /// A Trait for mapping an Entity to a database table
@@ -20,13 +21,13 @@ pub trait EntityName: IdenStatic + Default {
         None
     }
 
-    /// Get the name of the table
-    fn table_name(&self) -> &str;
-
-    /// Get the name of the module from the invoking `self.table_name()`
-    fn module_name(&self) -> &str {
-        self.table_name()
+    /// Method to get the comment for the schema, defaults to [Option::None] if not set
+    fn comment(&self) -> Option<&str> {
+        None
     }
+
+    /// Get the name of the table
+    fn table_name(&self) -> &'static str;
 
     /// Get the [TableRef] from invoking the `self.schema_name()`
     fn table_ref(&self) -> TableRef {
@@ -54,6 +55,9 @@ pub trait EntityTrait: EntityName {
     type Model: ModelTrait<Entity = Self> + FromQueryResult;
 
     #[allow(missing_docs)]
+    type ActiveModel: ActiveModelBehavior<Entity = Self>;
+
+    #[allow(missing_docs)]
     type Column: ColumnTrait;
 
     #[allow(missing_docs)]
@@ -62,7 +66,8 @@ pub trait EntityTrait: EntityName {
     #[allow(missing_docs)]
     type PrimaryKey: PrimaryKeyTrait + PrimaryKeyToColumn<Column = Self::Column>;
 
-    /// Check if the relation belongs to an Entity
+    /// Construct a belongs to relation, where this table has a foreign key to
+    /// another table.
     fn belongs_to<R>(related: R) -> RelationBuilder<Self, R>
     where
         R: EntityTrait,
@@ -70,7 +75,7 @@ pub trait EntityTrait: EntityName {
         RelationBuilder::new(RelationType::HasOne, Self::default(), related, false)
     }
 
-    /// Check if the entity has at least one relation
+    /// Construct a has one relation
     fn has_one<R>(_: R) -> RelationBuilder<Self, R>
     where
         R: EntityTrait + Related<Self>,
@@ -78,12 +83,22 @@ pub trait EntityTrait: EntityName {
         RelationBuilder::from_rel(RelationType::HasOne, R::to().rev(), true)
     }
 
-    /// Check if the Entity has many relations
+    /// Construct a has many relation
     fn has_many<R>(_: R) -> RelationBuilder<Self, R>
     where
         R: EntityTrait + Related<Self>,
     {
         RelationBuilder::from_rel(RelationType::HasMany, R::to().rev(), true)
+    }
+
+    /// Construct a has many relation, with the Relation provided.
+    /// This is for the case where `Related<Self>` is not possible.
+    fn has_many_via<R, T>(_: R, rel: T) -> RelationBuilder<Self, R>
+    where
+        R: EntityTrait,
+        T: RelationTrait,
+    {
+        RelationBuilder::from_rel(RelationType::HasMany, rel.def().rev(), true)
     }
 
     /// Construct select statement to find one / all models
@@ -271,16 +286,13 @@ pub trait EntityTrait: EntityName {
                 let col = key.into_column();
                 select = select.filter(col.eq(v));
             } else {
-                panic!("primary key arity mismatch");
+                unreachable!("primary key arity mismatch");
             }
-        }
-        if keys.next().is_some() {
-            panic!("primary key arity mismatch");
         }
         select
     }
 
-    /// Insert an model into database
+    /// Insert a model into database
     ///
     /// # Example (Postgres)
     ///
@@ -362,6 +374,48 @@ pub trait EntityTrait: EntityName {
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// To get back inserted Model
+    ///
+    /// ```
+    /// # use sea_orm::{error::*, tests_cfg::*, *};
+    /// #
+    /// # #[smol_potat::main]
+    /// # #[cfg(feature = "mock")]
+    /// # pub async fn main() -> Result<(), DbErr> {
+    /// #
+    /// # let db = MockDatabase::new(DbBackend::Postgres)
+    /// #     .append_query_results([
+    /// #         [cake::Model {
+    /// #             id: 1,
+    /// #             name: "Apple Pie".to_owned(),
+    /// #         }],
+    /// #     ])
+    /// #     .into_connection();
+    /// #
+    /// use sea_orm::{entity::*, query::*, tests_cfg::fruit};
+    ///
+    /// assert_eq!(
+    ///     cake::Entity::insert(cake::ActiveModel {
+    ///         id: NotSet,
+    ///         name: Set("Apple Pie".to_owned()),
+    ///     })
+    ///     .exec_with_returning(&db)
+    ///     .await?,
+    ///     cake::Model {
+    ///         id: 1,
+    ///         name: "Apple Pie".to_owned(),
+    ///     }
+    /// );
+    ///
+    /// assert_eq!(
+    ///     db.into_transaction_log()[0].statements()[0].sql,
+    ///     r#"INSERT INTO "cake" ("name") VALUES ($1) RETURNING "id", "name""#
+    /// );
+    /// #
+    /// # Ok(())
+    /// # }
+    /// ```
     fn insert<A>(model: A) -> Insert<A>
     where
         A: ActiveModelTrait<Entity = Self>,
@@ -397,9 +451,15 @@ pub trait EntityTrait: EntityName {
     ///     ..Default::default()
     /// };
     ///
+    /// let insert_result = cake::Entity::insert_many::<cake::ActiveModel, _>([])
+    ///     .exec(&db)
+    ///     .await?;
+    ///
+    /// assert_eq!(insert_result.last_insert_id, None);
+    ///
     /// let insert_result = cake::Entity::insert_many([apple, orange]).exec(&db).await?;
     ///
-    /// assert_eq!(insert_result.last_insert_id, 28);
+    /// assert_eq!(insert_result.last_insert_id, Some(28));
     ///
     /// assert_eq!(
     ///     db.into_transaction_log(),
@@ -445,7 +505,7 @@ pub trait EntityTrait: EntityName {
     ///
     /// let insert_result = cake::Entity::insert_many([apple, orange]).exec(&db).await?;
     ///
-    /// assert_eq!(insert_result.last_insert_id, 28);
+    /// assert_eq!(insert_result.last_insert_id, Some(28));
     ///
     /// assert_eq!(
     ///     db.into_transaction_log(),
@@ -459,15 +519,117 @@ pub trait EntityTrait: EntityName {
     /// # Ok(())
     /// # }
     /// ```
-    fn insert_many<A, I>(models: I) -> Insert<A>
+    ///
+    /// Before 1.1.3, if the active models have different column set, this method would panic.
+    /// Now, it'd attempt to fill in the missing columns with null
+    /// (which may or may not be correct, depending on whether the column is nullable):
+    ///
+    /// ```
+    /// use sea_orm::{
+    ///     DbBackend,
+    ///     entity::*,
+    ///     query::*,
+    ///     tests_cfg::{cake, cake_filling},
+    /// };
+    ///
+    /// assert_eq!(
+    ///     cake::Entity::insert_many([
+    ///         cake::ActiveModel {
+    ///             id: NotSet,
+    ///             name: Set("Apple Pie".to_owned()),
+    ///         },
+    ///         cake::ActiveModel {
+    ///             id: NotSet,
+    ///             name: Set("Orange Scone".to_owned()),
+    ///         }
+    ///     ])
+    ///     .build(DbBackend::Postgres)
+    ///     .to_string(),
+    ///     r#"INSERT INTO "cake" ("name") VALUES ('Apple Pie'), ('Orange Scone')"#,
+    /// );
+    ///
+    /// assert_eq!(
+    ///     cake_filling::Entity::insert_many([
+    ///         cake_filling::ActiveModel {
+    ///             cake_id: ActiveValue::set(2),
+    ///             filling_id: ActiveValue::NotSet,
+    ///         },
+    ///         cake_filling::ActiveModel {
+    ///             cake_id: ActiveValue::NotSet,
+    ///             filling_id: ActiveValue::set(3),
+    ///         }
+    ///     ])
+    ///     .build(DbBackend::Postgres)
+    ///     .to_string(),
+    ///     r#"INSERT INTO "cake_filling" ("cake_id", "filling_id") VALUES (2, NULL), (NULL, 3)"#,
+    /// );
+    /// ```
+    ///
+    /// To get back inserted Models
+    ///
+    /// ```
+    /// # use sea_orm::{error::*, tests_cfg::*, *};
+    /// #
+    /// # #[smol_potat::main]
+    /// # #[cfg(feature = "mock")]
+    /// # pub async fn main() -> Result<(), DbErr> {
+    /// #
+    /// # let db = MockDatabase::new(DbBackend::Postgres)
+    /// #     .append_query_results([
+    /// #         [cake::Model {
+    /// #             id: 1,
+    /// #             name: "Apple Pie".to_owned(),
+    /// #         }, cake::Model {
+    /// #             id: 2,
+    /// #             name: "Choco Pie".to_owned(),
+    /// #         }],
+    /// #     ])
+    /// #     .into_connection();
+    /// #
+    /// use sea_orm::{entity::*, query::*, tests_cfg::fruit};
+    ///
+    /// assert_eq!(
+    ///     cake::Entity::insert_many([
+    ///         cake::ActiveModel {
+    ///             id: NotSet,
+    ///             name: Set("Apple Pie".to_owned()),
+    ///         },
+    ///         cake::ActiveModel {
+    ///             id: NotSet,
+    ///             name: Set("Choco Pie".to_owned()),
+    ///         },
+    ///     ])
+    ///     .exec_with_returning(&db)
+    ///     .await?,
+    ///     [
+    ///         cake::Model {
+    ///             id: 1,
+    ///             name: "Apple Pie".to_owned(),
+    ///         },
+    ///         cake::Model {
+    ///             id: 2,
+    ///             name: "Choco Pie".to_owned(),
+    ///         }
+    ///     ]
+    /// );
+    ///
+    /// assert_eq!(
+    ///     db.into_transaction_log()[0].statements()[0].sql,
+    ///     r#"INSERT INTO "cake" ("name") VALUES ($1), ($2) RETURNING "id", "name""#
+    /// );
+    /// #
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn insert_many<A, I>(models: I) -> InsertMany<A>
     where
         A: ActiveModelTrait<Entity = Self>,
         I: IntoIterator<Item = A>,
     {
-        Insert::many(models)
+        InsertMany::many(models)
     }
 
-    /// Update an model in database
+    /// Update a model in database
     ///
     /// - To apply where conditions / filters, see [`QueryFilter`](crate::query::QueryFilter)
     ///
@@ -644,7 +806,7 @@ pub trait EntityTrait: EntityName {
         Update::many(Self::default())
     }
 
-    /// Delete an model from database
+    /// Delete a model from database
     ///
     /// - To apply where conditions / filters, see [`QueryFilter`](crate::query::QueryFilter)
     ///
@@ -837,11 +999,8 @@ pub trait EntityTrait: EntityName {
                 let col = key.into_column();
                 delete = delete.filter(col.eq(v));
             } else {
-                panic!("primary key arity mismatch");
+                unreachable!("primary key arity mismatch");
             }
-        }
-        if keys.next().is_some() {
-            panic!("primary key arity mismatch");
         }
         delete
     }
@@ -852,7 +1011,7 @@ mod tests {
     #[test]
     fn test_delete_by_id_1() {
         use crate::tests_cfg::cake;
-        use crate::{entity::*, query::*, DbBackend};
+        use crate::{DbBackend, entity::*, query::*};
         assert_eq!(
             cake::Entity::delete_by_id(1)
                 .build(DbBackend::Sqlite)
@@ -864,7 +1023,7 @@ mod tests {
     #[test]
     fn test_delete_by_id_2() {
         use crate::tests_cfg::cake_filling_price;
-        use crate::{entity::*, query::*, DbBackend};
+        use crate::{DbBackend, entity::*, query::*};
         assert_eq!(
             cake_filling_price::Entity::delete_by_id((1, 2))
                 .build(DbBackend::Sqlite)
@@ -928,7 +1087,7 @@ mod tests {
     #[test]
     #[cfg(feature = "macros")]
     fn entity_model_3() {
-        use crate::{entity::*, query::*, DbBackend};
+        use crate::{DbBackend, entity::*, query::*};
         use std::borrow::Cow;
 
         mod hello {
@@ -961,8 +1120,27 @@ mod tests {
         }
 
         delete_by_id("UUID".to_string());
-        delete_by_id("UUID".to_string());
         delete_by_id("UUID");
         delete_by_id(Cow::from("UUID"));
+    }
+
+    #[smol_potat::test]
+    async fn test_find_by_id() {
+        use crate::tests_cfg::{cake, cake_filling};
+        use crate::{DbBackend, EntityTrait, MockDatabase};
+
+        let db = MockDatabase::new(DbBackend::MySql).into_connection();
+
+        cake::Entity::find_by_id(1).all(&db).await.ok();
+        cake_filling::Entity::find_by_id((2, 3)).all(&db).await.ok();
+
+        // below does not compile:
+
+        // cake::Entity::find_by_id((1, 2)).all(&db).await.ok();
+        // cake_filling::Entity::find_by_id(1).all(&db).await.ok();
+        // cake_filling::Entity::find_by_id((1, 2, 3))
+        //     .all(&db)
+        //     .await
+        //     .ok();
     }
 }

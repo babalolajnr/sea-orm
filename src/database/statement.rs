@@ -1,5 +1,7 @@
 use crate::DbBackend;
-use sea_query::{inject_parameters, MysqlQueryBuilder, PostgresQueryBuilder, SqliteQueryBuilder};
+#[cfg(feature = "rbac")]
+pub use sea_query::audit::{AuditTrait, Error as AuditError, QueryAccessAudit};
+use sea_query::{MysqlQueryBuilder, PostgresQueryBuilder, SqliteQueryBuilder, inject_parameters};
 pub use sea_query::{Value, Values};
 use std::fmt;
 
@@ -16,16 +18,23 @@ pub struct Statement {
 }
 
 /// Any type that can build a [Statement]
-pub trait StatementBuilder {
+pub trait StatementBuilder: Sync {
     /// Method to call in order to build a [Statement]
     fn build(&self, db_backend: &DbBackend) -> Statement;
+
+    #[cfg(feature = "rbac")]
+    /// Method to audit access request of query
+    fn audit(&self) -> Result<QueryAccessAudit, AuditError>;
 }
 
 impl Statement {
     /// Create a [Statement] from a [crate::DatabaseBackend] and a raw SQL statement
-    pub fn from_string(db_backend: DbBackend, stmt: String) -> Statement {
+    pub fn from_string<T>(db_backend: DbBackend, stmt: T) -> Statement
+    where
+        T: Into<String>,
+    {
         Statement {
-            sql: stmt,
+            sql: stmt.into(),
             values: None,
             db_backend,
         }
@@ -33,22 +42,20 @@ impl Statement {
 
     /// Create a SQL statement from a [crate::DatabaseBackend], a
     /// raw SQL statement and param values
-    pub fn from_sql_and_values<I>(db_backend: DbBackend, sql: &str, values: I) -> Self
+    pub fn from_sql_and_values<I, T>(db_backend: DbBackend, sql: T, values: I) -> Self
     where
         I: IntoIterator<Item = Value>,
+        T: Into<String>,
     {
-        Self::from_string_values_tuple(
-            db_backend,
-            (sql.to_owned(), Values(values.into_iter().collect())),
-        )
+        Self::from_string_values_tuple(db_backend, (sql, Values(values.into_iter().collect())))
     }
 
-    pub(crate) fn from_string_values_tuple(
-        db_backend: DbBackend,
-        stmt: (String, Values),
-    ) -> Statement {
+    pub(crate) fn from_string_values_tuple<T>(db_backend: DbBackend, stmt: (T, Values)) -> Statement
+    where
+        T: Into<String>,
+    {
         Statement {
-            sql: stmt.0,
+            sql: stmt.0.into(),
             values: Some(stmt.1),
             db_backend,
         }
@@ -99,6 +106,11 @@ macro_rules! build_query_stmt {
                 let stmt = build_any_stmt!(self, db_backend);
                 Statement::from_string_values_tuple(*db_backend, stmt)
             }
+
+            #[cfg(feature = "rbac")]
+            fn audit(&self) -> Result<QueryAccessAudit, AuditError> {
+                AuditTrait::audit(self)
+            }
         }
     };
 }
@@ -107,6 +119,7 @@ build_query_stmt!(sea_query::InsertStatement);
 build_query_stmt!(sea_query::SelectStatement);
 build_query_stmt!(sea_query::UpdateStatement);
 build_query_stmt!(sea_query::DeleteStatement);
+build_query_stmt!(sea_query::WithQuery);
 
 macro_rules! build_schema_stmt {
     ($stmt: ty) => {
@@ -114,6 +127,11 @@ macro_rules! build_schema_stmt {
             fn build(&self, db_backend: &DbBackend) -> Statement {
                 let stmt = build_any_stmt!(self, db_backend);
                 Statement::from_string(*db_backend, stmt)
+            }
+
+            #[cfg(feature = "rbac")]
+            fn audit(&self) -> Result<QueryAccessAudit, AuditError> {
+                todo!("Audit not supported for {} yet", stringify!($stmt))
             }
         }
     };
@@ -135,6 +153,11 @@ macro_rules! build_type_stmt {
             fn build(&self, db_backend: &DbBackend) -> Statement {
                 let stmt = build_postgres_stmt!(self, db_backend);
                 Statement::from_string(*db_backend, stmt)
+            }
+
+            #[cfg(feature = "rbac")]
+            fn audit(&self) -> Result<QueryAccessAudit, AuditError> {
+                todo!("Audit not supported for {} yet", stringify!($stmt))
             }
         }
     };

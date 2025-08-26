@@ -7,10 +7,10 @@ use poem::error::InternalServerError;
 use poem::http::StatusCode;
 use poem::listener::TcpListener;
 use poem::web::{Data, Form, Html, Path, Query};
-use poem::{get, handler, post, EndpointExt, Error, IntoResponse, Result, Route, Server};
-use poem_example_core::{
-    sea_orm::{Database, DatabaseConnection},
+use poem::{EndpointExt, Error, IntoResponse, Result, Route, Server, get, handler, post};
+use poem_example_service::{
     Mutation as MutationCore, Query as QueryCore,
+    sea_orm::{Database, DatabaseConnection},
 };
 use serde::Deserialize;
 use tera::Tera;
@@ -122,7 +122,9 @@ async fn delete(state: Data<&AppState>, Path(id): Path<i32>) -> Result<impl Into
 
 #[tokio::main]
 async fn start() -> std::io::Result<()> {
-    std::env::set_var("RUST_LOG", "debug");
+    unsafe {
+        std::env::set_var("RUST_LOG", "debug");
+    }
     tracing_subscriber::fmt::init();
 
     // get env vars

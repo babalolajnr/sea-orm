@@ -1,21 +1,23 @@
-use futures::Future;
 use std::collections::HashSet;
 use std::fmt::Display;
+use std::future::Future;
 use std::pin::Pin;
 use std::time::SystemTime;
 use tracing::info;
 
 use sea_orm::sea_query::{
-    self, extension::postgres::Type, Alias, Expr, ForeignKey, Iden, JoinType, Query,
-    SelectStatement, SimpleExpr, Table,
+    self, Alias, Expr, ExprTrait, ForeignKey, IntoIden, JoinType, Order, Query, SelectStatement,
+    SimpleExpr, Table, extension::postgres::Type,
 };
 use sea_orm::{
-    ActiveModelTrait, ActiveValue, ColumnTrait, Condition, ConnectionTrait, DbBackend, DbErr,
-    EntityTrait, QueryFilter, QueryOrder, Schema, Statement, TransactionTrait,
+    ActiveModelTrait, ActiveValue, Condition, ConnectionTrait, DbBackend, DbErr, DeriveIden,
+    DynIden, EntityTrait, FromQueryResult, Iterable, QueryFilter, Schema, Statement,
+    TransactionTrait,
 };
-use sea_schema::{mysql::MySql, postgres::Postgres, probe::SchemaProbe, sqlite::Sqlite};
+#[allow(unused_imports)]
+use sea_schema::probe::SchemaProbe;
 
-use super::{seaql_migrations, IntoSchemaManagerConnection, MigrationTrait, SchemaManager};
+use super::{IntoSchemaManagerConnection, MigrationTrait, SchemaManager, seaql_migrations};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 /// Status of migration
@@ -59,6 +61,11 @@ pub trait MigratorTrait: Send {
     /// Vector of migrations in time sequence
     fn migrations() -> Vec<Box<dyn MigrationTrait>>;
 
+    /// Name of the migration table, it is `seaql_migrations` by default
+    fn migration_table_name() -> DynIden {
+        seaql_migrations::Entity.into_iden()
+    }
+
     /// Get list of migrations wrapped in `Migration` struct
     fn get_migration_files() -> Vec<Migration> {
         Self::migrations()
@@ -76,8 +83,13 @@ pub trait MigratorTrait: Send {
         C: ConnectionTrait,
     {
         Self::install(db).await?;
-        seaql_migrations::Entity::find()
-            .order_by_asc(seaql_migrations::Column::Version)
+        let stmt = Query::select()
+            .table_name(Self::migration_table_name())
+            .columns(seaql_migrations::Column::iter().map(IntoIden::into_iden))
+            .order_by(seaql_migrations::Column::Version, Order::Asc)
+            .to_owned();
+        let builder = db.get_database_backend();
+        seaql_migrations::Model::find_by_statement(builder.build(&stmt))
             .all(db)
             .await
     }
@@ -153,10 +165,13 @@ pub trait MigratorTrait: Send {
         C: ConnectionTrait,
     {
         let builder = db.get_database_backend();
+        let table_name = Self::migration_table_name();
         let schema = Schema::new(builder);
-        let mut stmt = schema.create_table_from_entity(seaql_migrations::Entity);
+        let mut stmt = schema
+            .create_table_from_entity(seaql_migrations::Entity)
+            .table_name(table_name);
         stmt.if_not_exists();
-        db.execute(builder.build(&stmt)).await.map(|_| ())
+        db.execute(&stmt).await.map(|_| ())
     }
 
     /// Check the status of all migrations
@@ -180,7 +195,7 @@ pub trait MigratorTrait: Send {
     where
         C: IntoSchemaManagerConnection<'c>,
     {
-        exec_with_connection::<'_, _, _, Self>(db, move |manager| {
+        exec_with_connection::<'_, _, _>(db, move |manager| {
             Box::pin(async move { exec_fresh::<Self>(manager).await })
         })
         .await
@@ -191,7 +206,7 @@ pub trait MigratorTrait: Send {
     where
         C: IntoSchemaManagerConnection<'c>,
     {
-        exec_with_connection::<'_, _, _, Self>(db, move |manager| {
+        exec_with_connection::<'_, _, _>(db, move |manager| {
             Box::pin(async move {
                 exec_down::<Self>(manager, None).await?;
                 exec_up::<Self>(manager, None).await
@@ -205,7 +220,7 @@ pub trait MigratorTrait: Send {
     where
         C: IntoSchemaManagerConnection<'c>,
     {
-        exec_with_connection::<'_, _, _, Self>(db, move |manager| {
+        exec_with_connection::<'_, _, _>(db, move |manager| {
             Box::pin(async move { exec_down::<Self>(manager, None).await })
         })
         .await
@@ -216,7 +231,7 @@ pub trait MigratorTrait: Send {
     where
         C: IntoSchemaManagerConnection<'c>,
     {
-        exec_with_connection::<'_, _, _, Self>(db, move |manager| {
+        exec_with_connection::<'_, _, _>(db, move |manager| {
             Box::pin(async move { exec_up::<Self>(manager, steps).await })
         })
         .await
@@ -227,20 +242,19 @@ pub trait MigratorTrait: Send {
     where
         C: IntoSchemaManagerConnection<'c>,
     {
-        exec_with_connection::<'_, _, _, Self>(db, move |manager| {
+        exec_with_connection::<'_, _, _>(db, move |manager| {
             Box::pin(async move { exec_down::<Self>(manager, steps).await })
         })
         .await
     }
 }
 
-async fn exec_with_connection<'c, C, F, M>(db: C, f: F) -> Result<(), DbErr>
+async fn exec_with_connection<'c, C, F>(db: C, f: F) -> Result<(), DbErr>
 where
     C: IntoSchemaManagerConnection<'c>,
     F: for<'b> Fn(
         &'b SchemaManager<'_>,
     ) -> Pin<Box<dyn Future<Output = Result<(), DbErr>> + Send + 'b>>,
-    M: MigratorTrait + ?Sized,
 {
     let db = db.into_schema_manager_connection();
 
@@ -255,6 +269,10 @@ where
             let manager = SchemaManager::new(db);
             f(&manager).await
         }
+        db => Err(DbErr::BackendNotSupported {
+            db: db.as_str(),
+            ctx: "exec_with_connection",
+        }),
     }
 }
 
@@ -270,7 +288,7 @@ where
     // Temporarily disable the foreign key check
     if db_backend == DbBackend::Sqlite {
         info!("Disabling foreign key check");
-        db.execute(Statement::from_string(
+        db.execute_raw(Statement::from_string(
             db_backend,
             "PRAGMA foreign_keys = OFF".to_owned(),
         ))
@@ -282,7 +300,7 @@ where
     if db_backend == DbBackend::MySql {
         info!("Dropping all foreign keys");
         let stmt = query_mysql_foreign_keys(db);
-        let rows = db.query_all(db_backend.build(&stmt)).await?;
+        let rows = db.query_all(&stmt).await?;
         for row in rows.into_iter() {
             let constraint_name: String = row.try_get("", "CONSTRAINT_NAME")?;
             let table_name: String = row.try_get("", "TABLE_NAME")?;
@@ -293,15 +311,15 @@ where
             let mut stmt = ForeignKey::drop();
             stmt.table(Alias::new(table_name.as_str()))
                 .name(constraint_name.as_str());
-            db.execute(db_backend.build(&stmt)).await?;
+            db.execute(&stmt).await?;
             info!("Foreign key '{}' has been dropped", constraint_name);
         }
         info!("All foreign keys dropped");
     }
 
     // Drop all tables
-    let stmt = query_tables(db);
-    let rows = db.query_all(db_backend.build(&stmt)).await?;
+    let stmt = query_tables(db)?;
+    let rows = db.query_all(&stmt).await?;
     for row in rows.into_iter() {
         let table_name: String = row.try_get("", "table_name")?;
         info!("Dropping table '{}'", table_name);
@@ -309,7 +327,7 @@ where
         stmt.table(Alias::new(table_name.as_str()))
             .if_exists()
             .cascade();
-        db.execute(db_backend.build(&stmt)).await?;
+        db.execute(&stmt).await?;
         info!("Table '{}' has been dropped", table_name);
     }
 
@@ -317,13 +335,13 @@ where
     if db_backend == DbBackend::Postgres {
         info!("Dropping all types");
         let stmt = query_pg_types(db);
-        let rows = db.query_all(db_backend.build(&stmt)).await?;
+        let rows = db.query_all(&stmt).await?;
         for row in rows {
             let type_name: String = row.try_get("", "typname")?;
             info!("Dropping type '{}'", type_name);
             let mut stmt = Type::drop();
             stmt.name(Alias::new(&type_name));
-            db.execute(db_backend.build(&stmt)).await?;
+            db.execute(&stmt).await?;
             info!("Type '{}' has been dropped", type_name);
         }
     }
@@ -331,7 +349,7 @@ where
     // Restore the foreign key check
     if db_backend == DbBackend::Sqlite {
         info!("Restoring foreign key check");
-        db.execute(Statement::from_string(
+        db.execute_raw(Statement::from_string(
             db_backend,
             "PRAGMA foreign_keys = ON".to_owned(),
         ))
@@ -374,11 +392,12 @@ where
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("SystemTime before UNIX EPOCH!");
-        seaql_migrations::ActiveModel {
+        seaql_migrations::Entity::insert(seaql_migrations::ActiveModel {
             version: ActiveValue::Set(migration.name().to_owned()),
             applied_at: ActiveValue::Set(now.as_secs() as i64),
-        }
-        .insert(db)
+        })
+        .table_name(M::migration_table_name())
+        .exec(db)
         .await?;
     }
 
@@ -414,7 +433,8 @@ where
         migration.down(manager).await?;
         info!("Migration '{}' has been rollbacked", migration.name());
         seaql_migrations::Entity::delete_many()
-            .filter(seaql_migrations::Column::Version.eq(migration.name()))
+            .filter(Expr::col(seaql_migrations::Column::Version).eq(migration.name()))
+            .table_name(M::migration_table_name())
             .exec(db)
             .await?;
     }
@@ -422,35 +442,49 @@ where
     Ok(())
 }
 
-fn query_tables<C>(db: &C) -> SelectStatement
+fn query_tables<C>(db: &C) -> Result<SelectStatement, DbErr>
 where
     C: ConnectionTrait,
 {
     match db.get_database_backend() {
-        DbBackend::MySql => MySql::query_tables(),
-        DbBackend::Postgres => Postgres::query_tables(),
-        DbBackend::Sqlite => Sqlite::query_tables(),
+        #[cfg(feature = "sqlx-mysql")]
+        DbBackend::MySql => Ok(sea_schema::mysql::MySql.query_tables()),
+        #[cfg(feature = "sqlx-postgres")]
+        DbBackend::Postgres => Ok(sea_schema::postgres::Postgres.query_tables()),
+        #[cfg(feature = "sqlx-sqlite")]
+        DbBackend::Sqlite => Ok(sea_schema::sqlite::Sqlite.query_tables()),
+        #[allow(unreachable_patterns)]
+        other => Err(DbErr::BackendNotSupported {
+            db: other.as_str(),
+            ctx: "query_tables",
+        }),
     }
 }
 
+// this function is only called after checking db backend, the panic is unreachable
 fn get_current_schema<C>(db: &C) -> SimpleExpr
 where
     C: ConnectionTrait,
 {
     match db.get_database_backend() {
-        DbBackend::MySql => MySql::get_current_schema(),
-        DbBackend::Postgres => Postgres::get_current_schema(),
-        DbBackend::Sqlite => unimplemented!(),
+        #[cfg(feature = "sqlx-mysql")]
+        DbBackend::MySql => sea_schema::mysql::MySql::get_current_schema(),
+        #[cfg(feature = "sqlx-postgres")]
+        DbBackend::Postgres => sea_schema::postgres::Postgres::get_current_schema(),
+        #[cfg(feature = "sqlx-sqlite")]
+        DbBackend::Sqlite => sea_schema::sqlite::Sqlite::get_current_schema(),
+        #[allow(unreachable_patterns)]
+        other => panic!("{other:?} feature is off"),
     }
 }
 
-#[derive(Iden)]
+#[derive(DeriveIden)]
 enum InformationSchema {
-    #[iden = "information_schema"]
+    #[sea_orm(iden = "information_schema")]
     Schema,
-    #[iden = "TABLE_NAME"]
+    #[sea_orm(iden = "TABLE_NAME")]
     TableName,
-    #[iden = "CONSTRAINT_NAME"]
+    #[sea_orm(iden = "CONSTRAINT_NAME")]
     ConstraintName,
     TableConstraints,
     TableSchema,
@@ -472,7 +506,7 @@ where
     ))
     .cond_where(
         Condition::all()
-            .add(Expr::expr(get_current_schema(db)).equals((
+            .add(get_current_schema(db).equals((
                 InformationSchema::TableConstraints,
                 InformationSchema::TableSchema,
             )))
@@ -487,7 +521,7 @@ where
     stmt
 }
 
-#[derive(Iden)]
+#[derive(DeriveIden)]
 enum PgType {
     Table,
     Typname,
@@ -495,7 +529,7 @@ enum PgType {
     Typelem,
 }
 
-#[derive(Iden)]
+#[derive(DeriveIden)]
 enum PgNamespace {
     Table,
     Oid,
@@ -517,11 +551,56 @@ where
         )
         .cond_where(
             Condition::all()
-                .add(
-                    Expr::expr(get_current_schema(db))
-                        .equals((PgNamespace::Table, PgNamespace::Nspname)),
-                )
+                .add(get_current_schema(db).equals((PgNamespace::Table, PgNamespace::Nspname)))
                 .add(Expr::col((PgType::Table, PgType::Typelem)).eq(0)),
         );
     stmt
+}
+
+trait QueryTable {
+    type Statement;
+
+    fn table_name(self, table_name: DynIden) -> Self::Statement;
+}
+
+impl QueryTable for SelectStatement {
+    type Statement = SelectStatement;
+
+    fn table_name(mut self, table_name: DynIden) -> SelectStatement {
+        self.from(table_name);
+        self
+    }
+}
+
+impl QueryTable for sea_query::TableCreateStatement {
+    type Statement = sea_query::TableCreateStatement;
+
+    fn table_name(mut self, table_name: DynIden) -> sea_query::TableCreateStatement {
+        self.table(table_name);
+        self
+    }
+}
+
+impl<A> QueryTable for sea_orm::Insert<A>
+where
+    A: ActiveModelTrait,
+{
+    type Statement = sea_orm::Insert<A>;
+
+    fn table_name(mut self, table_name: DynIden) -> sea_orm::Insert<A> {
+        sea_orm::QueryTrait::query(&mut self).into_table(table_name);
+        self
+    }
+}
+
+impl<E> QueryTable for sea_orm::DeleteMany<E>
+where
+    E: EntityTrait,
+{
+    type Statement = sea_orm::DeleteMany<E>;
+
+    fn table_name(mut self, table_name: DynIden) -> sea_orm::DeleteMany<E> {
+        sea_orm::QueryTrait::query(&mut self).from_table(table_name);
+        self
+    }
 }
